@@ -5,6 +5,7 @@
 *.png
 
 # Folders
+.claude/
 .vscode/
 .gradio/
 local/
