@@ -18,14 +18,14 @@ def sample_token(logits: torch.Tensor, temperature: float = 1.0, top_p: float = 
     if logits.dim() not in [1, 2]:
         raise ValueError("logits must have shape [vocab_size] or [batch_size, vocab_size]")
         
-    # Handle single dimension input
+    # 同时兼容单条样本 [vocab] 和批量样本 [batch, vocab] 两种输入。
     is_single_input = logits.dim() == 1
     if is_single_input:
         logits = logits.unsqueeze(0)
     
     batch_size = logits.shape[0]
     
-    # For greedy sampling (temperature=0), just return argmax
+    # temperature 近似 0 时退化成 greedy decode。
     if temperature == 0 or temperature <= 1e-5:
         tokens = torch.argmax(logits, dim=-1)
         return tokens.item() if is_single_input else tokens
@@ -33,7 +33,7 @@ def sample_token(logits: torch.Tensor, temperature: float = 1.0, top_p: float = 
     # Convert to probabilities
     probs = torch.nn.functional.softmax(logits / temperature, dim=-1)
     
-    # Apply top-k filtering first (if specified)
+    # 先做 top-k，再做 top-p，和大多数生成实现保持一致。
     if top_k != -1:
         # Get top-k values and indices
         top_k_values, top_k_indices = torch.topk(probs, k=min(top_k, probs.shape[-1]), dim=-1)
@@ -48,7 +48,7 @@ def sample_token(logits: torch.Tensor, temperature: float = 1.0, top_p: float = 
         # Renormalize probabilities
         probs = probs / probs.sum(dim=-1, keepdim=True)
     
-    # Apply top-p (nucleus) sampling
+    # nucleus sampling：保留累计概率达到 top_p 的最小 token 集。
     if top_p < 1.0:
         # Sort probabilities in descending order
         sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)

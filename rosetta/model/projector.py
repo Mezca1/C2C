@@ -35,7 +35,7 @@ class Projector(nn.Module):
         
         projected_cache = DynamicCache()
         
-        # Process each layer
+        # 按层处理 KV cache；每层都会走一次 forward，把 source KV 投到 target 语义空间。
         for layer_idx in range(len(source_kv_cache.key_cache)):
             source_key = source_kv_cache.key_cache[layer_idx]  # (B, H, N, D_s)
             source_value = source_kv_cache.value_cache[layer_idx]  # (B, H, N, D_s)
@@ -51,7 +51,7 @@ class Projector(nn.Module):
                 target_key = torch.zeros(B, H, N, D_t, device=source_key.device, dtype=source_key.dtype)
                 target_value = torch.zeros(B, H, N, D_t, device=source_value.device, dtype=source_value.dtype)
             
-            # Reshape for forward pass: DynamicCache format (B, H, N, D) -> projector format (B, N, H, D)
+            # DynamicCache 默认是 (B, H, N, D)，而 projector 统一使用 (B, N, H, D)。
             source_key_reshaped = source_key.transpose(1, 2)
             source_value_reshaped = source_value.transpose(1, 2)
             target_key_reshaped = target_key.transpose(1, 2)
@@ -62,7 +62,7 @@ class Projector(nn.Module):
             target_kv = (target_key_reshaped, target_value_reshaped)
             projected_key, projected_value = self.forward(source_kv, target_kv)
             
-            # Reshape back: projector format (B, N, H, D) -> DynamicCache format (B, H, N, D)
+            # 投影结束后再转回 DynamicCache 习惯的布局，方便交给模型继续使用。
             projected_key = projected_key.transpose(1, 2)
             projected_value = projected_value.transpose(1, 2)
             
@@ -147,7 +147,7 @@ class ModernMLP(nn.Module):
         for layer in self.layers:
             x = layer(x)
         
-        # Add residual connection
+        # residual 主要用于稳定 projector 训练，避免纯 MLP 过深时退化。
         if self.use_residual:
             if self.residual_proj is not None:
                 residual = self.residual_proj(residual)
@@ -250,7 +250,7 @@ class AllInOneProjector(Projector):
         self.weight_hidden_dim = weight_hidden_dim
         self.max_sequence_length = max_sequence_length
         
-        # Configuration
+        # 这些开关决定 gate/weight 是“全局一个值”还是“按 token / 按 head / 按 value 细粒度变化”。
         self.gate_granularity = gate_granularity
         self.gate_depends_on_input = gate_depends_on_input
         self.gate_input_features = gate_input_features
@@ -1019,6 +1019,237 @@ class C2CProjector(Projector):
             self.last_value_gate_logit = float(self.value_gate_logit.detach().cpu().item())
         except Exception:
             # Best-effort capture; never break forward path
+            pass
+
+        return output_key, output_value
+
+@register_model
+@capture_init_args
+class ResidualC2CProjector(Projector):
+    """
+    Residual projector for direction-A style C2C experiments.
+
+    Unlike C2CProjector, the residual base is an aligned source KV cache rather
+    than the receiver/target KV cache:
+
+        output = Align(source_kv) + gate * scalar * Residual(source_kv)
+
+    This keeps the original projectors untouched while making the "sharer KV as
+    residual base" idea available as an opt-in projector type.
+    """
+
+    def __init__(
+        self,
+        source_dim: int,
+        target_dim: int,
+        source_num_heads: int = 1,
+        target_num_heads: int = 1,
+        hidden_dim: int = 256,
+        intermediate_dim: Optional[int] = None,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        use_layer_norm: bool = True,
+        initial_temperature: float = 1.0,
+        final_temperature: float = 0.001,
+        anneal_steps: int = 1929,
+        scalar_temperature: float = 1.0,
+        use_gumbel: bool = True,
+        gate_init_value: float = 0.0,
+        target_base_init: float = 0.0,
+        trainable_target_base: bool = True,
+        zero_init_residual: bool = True,
+        identity_init_align: bool = True,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+
+        self.source_dim = source_dim
+        self.target_dim = target_dim
+        self.source_num_heads = source_num_heads
+        self.target_num_heads = target_num_heads
+        self.scalar_temperature = scalar_temperature
+        self.use_gumbel = use_gumbel
+        self.trainable_target_base = trainable_target_base
+
+        in_dim = source_dim * source_num_heads
+        out_dim = target_dim * target_num_heads
+        residual_hidden = intermediate_dim or hidden_dim
+
+        self.key_align = nn.Linear(in_dim, out_dim, bias=True, dtype=dtype)
+        self.value_align = nn.Linear(in_dim, out_dim, bias=True, dtype=dtype)
+        self._init_align(self.key_align, identity_init_align)
+        self._init_align(self.value_align, identity_init_align)
+
+        self.key_residual = self._build_residual_mlp(
+            in_dim, hidden_dim, residual_hidden, out_dim,
+            num_layers, activation, use_layer_norm, dropout, dtype
+        )
+        self.value_residual = self._build_residual_mlp(
+            in_dim, hidden_dim, residual_hidden, out_dim,
+            num_layers, activation, use_layer_norm, dropout, dtype
+        )
+
+        self.key_scalar_head = nn.Linear(hidden_dim, target_num_heads, dtype=dtype)
+        self.value_scalar_head = nn.Linear(hidden_dim, target_num_heads, dtype=dtype)
+
+        if zero_init_residual:
+            self._zero_last_linear(self.key_residual)
+            self._zero_last_linear(self.value_residual)
+            nn.init.zeros_(self.key_scalar_head.weight)
+            nn.init.zeros_(self.key_scalar_head.bias)
+            nn.init.zeros_(self.value_scalar_head.weight)
+            nn.init.zeros_(self.value_scalar_head.bias)
+
+        self.key_gate_logit = nn.Parameter(torch.tensor(gate_init_value, dtype=dtype))
+        self.value_gate_logit = nn.Parameter(torch.tensor(gate_init_value, dtype=dtype))
+        target_base_logit = torch.tensor(self._safe_logit(target_base_init), dtype=dtype)
+        if trainable_target_base:
+            self.target_base_logit = nn.Parameter(target_base_logit)
+        else:
+            self.register_buffer("target_base_logit", target_base_logit)
+        self.register_buffer("gate_temperature", torch.tensor(initial_temperature, dtype=dtype))
+        self.initial_temperature = initial_temperature
+        self.final_temperature = final_temperature
+        self.anneal_steps = anneal_steps
+
+    @staticmethod
+    def _safe_logit(value: float) -> float:
+        value = min(max(value, 1e-4), 1.0 - 1e-4)
+        return math.log(value / (1.0 - value))
+
+    def _init_align(self, layer: nn.Linear, identity_init_align: bool) -> None:
+        if identity_init_align and layer.in_features == layer.out_features:
+            nn.init.eye_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        else:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def _build_residual_mlp(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        intermediate_dim: int,
+        out_dim: int,
+        num_layers: int,
+        activation: str,
+        use_layer_norm: bool,
+        dropout: float,
+        dtype: torch.dtype,
+    ) -> nn.Sequential:
+        if num_layers < 2:
+            raise ValueError("ResidualC2CProjector requires num_layers >= 2")
+
+        if activation.lower() == "gelu":
+            act_layer = nn.GELU
+        elif activation.lower() == "relu":
+            act_layer = nn.ReLU
+        elif activation.lower() == "silu":
+            act_layer = nn.SiLU
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+        layers = [nn.Linear(in_dim, hidden_dim, dtype=dtype)]
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim, dtype=dtype))
+        layers.append(act_layer())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+
+        for _ in range(max(0, num_layers - 2)):
+            layers.append(nn.Linear(hidden_dim, intermediate_dim, dtype=dtype))
+            if use_layer_norm:
+                layers.append(nn.LayerNorm(intermediate_dim, dtype=dtype))
+            layers.append(act_layer())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            hidden_dim = intermediate_dim
+
+        layers.append(nn.Linear(hidden_dim, out_dim, dtype=dtype))
+        return nn.Sequential(*layers)
+
+    def _zero_last_linear(self, module: nn.Module) -> None:
+        for layer in reversed(list(module.modules())):
+            if isinstance(layer, nn.Linear):
+                nn.init.zeros_(layer.weight)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
+                return
+
+    def update_temperature(self, step: int):
+        ratio = min(step / self.anneal_steps, 1.0)
+        temp = self.initial_temperature * (self.final_temperature / self.initial_temperature) ** ratio
+        self.gate_temperature.fill_(temp)
+
+    def _gate(self, logit: Tensor, shape: Tuple[int, int, int, int]) -> Tensor:
+        B, H, N, _ = shape
+        logit = logit.view(1, 1, 1, 1)
+        if self.training and self.use_gumbel:
+            u = torch.rand(B, H, N, 1, device=logit.device, dtype=logit.dtype)
+            g = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+            return torch.sigmoid((logit + g) / self.gate_temperature)
+        return torch.sigmoid(logit / self.gate_temperature).expand(B, H, N, 1)
+
+    def forward(
+        self,
+        source_kv: Tuple[Tensor, Tensor],
+        target_kv: Optional[Tuple[Tensor, Tensor]] = None,
+        position_ids: Optional[Tensor] = None,
+        max_pos: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        source_key, source_value = source_kv
+
+        B, Hs, N, Ds = source_key.shape
+        Ht = self.target_num_heads
+        Dt = self.target_dim
+
+        source_key_flat = source_key.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+        source_value_flat = source_value.transpose(1, 2).contiguous().view(B, N, Hs * Ds)
+
+        aligned_key_flat = self.key_align(source_key_flat)
+        aligned_value_flat = self.value_align(source_value_flat)
+
+        key_hidden = self.key_residual[:-1](source_key_flat)
+        value_hidden = self.value_residual[:-1](source_value_flat)
+        residual_key_flat = self.key_residual[-1](key_hidden)
+        residual_value_flat = self.value_residual[-1](value_hidden)
+
+        aligned_key = aligned_key_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        aligned_value = aligned_value_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        residual_key = residual_key_flat.view(B, N, Ht, Dt).transpose(1, 2)
+        residual_value = residual_value_flat.view(B, N, Ht, Dt).transpose(1, 2)
+
+        if target_kv is not None:
+            target_key, target_value = target_kv
+            target_base_weight = torch.sigmoid(self.target_base_logit).to(dtype=aligned_key.dtype)
+            target_key_base = target_key.detach().clone()
+            target_value_base = target_value.detach().clone()
+            base_key = target_base_weight * target_key_base + (1.0 - target_base_weight) * aligned_key
+            base_value = target_base_weight * target_value_base + (1.0 - target_base_weight) * aligned_value
+        else:
+            target_base_weight = aligned_key.new_tensor(0.0)
+            base_key = aligned_key
+            base_value = aligned_value
+
+        key_scalar = self.key_scalar_head(key_hidden).permute(0, 2, 1).unsqueeze(-1)
+        value_scalar = self.value_scalar_head(value_hidden).permute(0, 2, 1).unsqueeze(-1)
+        norm_key_scalar = torch.sigmoid(key_scalar / self.scalar_temperature)
+        norm_value_scalar = torch.sigmoid(value_scalar / self.scalar_temperature)
+
+        key_gate = self._gate(self.key_gate_logit, (B, Ht, N, Dt))
+        value_gate = self._gate(self.value_gate_logit, (B, Ht, N, Dt))
+
+        output_key = base_key + key_gate * norm_key_scalar * residual_key
+        output_value = base_value + value_gate * norm_value_scalar * residual_value
+
+        try:
+            self.last_norm_key_scalar = norm_key_scalar.detach().cpu()
+            self.last_norm_value_scalar = norm_value_scalar.detach().cpu()
+            self.last_key_gate_logit = float(self.key_gate_logit.detach().cpu().item())
+            self.last_value_gate_logit = float(self.value_gate_logit.detach().cpu().item())
+            self.last_target_base_weight = float(target_base_weight.detach().cpu().item())
+        except Exception:
             pass
 
         return output_key, output_value

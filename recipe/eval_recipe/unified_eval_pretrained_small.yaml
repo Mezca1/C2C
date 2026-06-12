@@ -1,0 +1,26 @@
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: Qwen/Qwen3-0.6B
+    teacher_model: Qwen/Qwen2.5-0.5B-Instruct
+    is_do_alignment: false
+    alignment_strategy: "longest"
+    checkpoints_dir: /home/lishaowei/.cache/huggingface/hub/models--nics-efc--C2C_Fuser/snapshots/909c76d71cfb946171aa2ab7912dd07c0ba2e995/qwen3_0.6b+qwen2.5_0.5b_Fuser/final
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/pretrained_small_eval
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0]
+  answer_method: generate
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  subjects: ["nutrition"]
+  limit: 20
+  math_grading_method: "comprehensive"

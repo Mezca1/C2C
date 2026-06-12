@@ -20,6 +20,7 @@ except Exception:
     SampleDecoderOnlyOutput = None
 
 def clone_kv_cache(kv_cache: DynamicCache) -> DynamicCache:
+        # 训练/推理中会多次基于已有 cache 做投影融合，这里先拷贝，避免原始 cache 被原地污染。
         new_cache = DynamicCache()
         for k, v in zip(kv_cache.key_cache, kv_cache.value_cache):
             new_cache.key_cache.append(k.clone().detach())
@@ -32,7 +33,7 @@ def hybrid_to_dynamic(hybrid_cache):
     if isinstance(hybrid_cache, DynamicCache):
         return hybrid_cache
 
-    # 手动从 HybridCache 提取
+    # 不同 Transformers 版本/模型返回的 cache 类型可能不同，这里统一成 DynamicCache 方便后续处理。
     if hasattr(hybrid_cache, "key_cache") and hasattr(hybrid_cache, "value_cache"):
         keys = hybrid_cache.key_cache
         values = hybrid_cache.value_cache
@@ -66,9 +67,9 @@ class RosettaModel(nn.Module):
         self.kv_cache_dict = {}
         self._generation_hook_handlers = []
 
-        # Multi-source fusion mode: 
-        # "sequential" (default): each source updates base cache iteratively
-        # "parallel": all sources project from clean base cache, then sum projections
+        # 多 sharer 融合模式：
+        # sequential: 一个 sharer 融合后的结果会继续作为下一个 sharer 的输入
+        # parallel: 所有 sharer 都基于同一份 base cache 独立投影，最后再汇总
         self.include_response = include_response
         if multi_source_fusion_mode not in ["sequential", "parallel"]:
             raise ValueError(f"multi_source_fusion_mode must be 'sequential' or 'parallel', got '{multi_source_fusion_mode}'")
@@ -117,11 +118,12 @@ class RosettaModel(nn.Module):
         Repeated calls for the same (target, source, target_layer) append additional pairs.
         """
 
+        # projector_dict 记录“源模型第几层 -> 目标模型第几层 -> 用哪个 projector”。
         if target_model_idx not in self.projector_dict.keys():
             self.projector_dict[target_model_idx] = {}
         if source_model_idx not in self.projector_dict[target_model_idx].keys():
             self.projector_dict[target_model_idx][source_model_idx] = {}
-        # Accumulate list of (source_layer, projector_idx) for this target layer
+        # 同一目标层允许挂多个源层映射，便于 last_aligned/k_nearest 这类策略复用。
         layer_entry = self.projector_dict[target_model_idx][source_model_idx].get(target_model_layer_idx)
         if layer_entry is None:
             self.projector_dict[target_model_idx][source_model_idx][target_model_layer_idx] = [(source_model_layer_idx, projector_idx)]
@@ -140,7 +142,7 @@ class RosettaModel(nn.Module):
         pair_list = self.projector_dict[target_model_idx][source_model_idx][target_model_layer_idx]
         if len(pair_list) == 0:
             raise ValueError("No projector configured for the given target layer")
-        # Prefer exact source layer match
+        # 优先返回源层完全匹配的 projector；没有时退化到该目标层的第一个配置。
         for src_layer, projector_id in pair_list:
             if src_layer == source_model_layer_idx:
                 return self.projector_list[projector_id]
@@ -187,7 +189,7 @@ class RosettaModel(nn.Module):
         if target_model_idx not in self.kv_cache_dict.keys():
             self.kv_cache_dict[target_model_idx] = {}
         if cache is None:
-            # Initialize with a DynamicCache instead of RosettaCache for now
+            # 这里缓存的是“某个 source 对某个 target”的中间 KV 状态。
             self.kv_cache_dict[target_model_idx][source_model_idx] = DynamicCache() # noqa, maybe we should use RosettaCache here
         else:
             self.kv_cache_dict[target_model_idx][source_model_idx] = cache
@@ -206,7 +208,7 @@ class RosettaModel(nn.Module):
         """
         import types
 
-        # Lazy imports to avoid hard dependency at module import time
+        # 延迟导入，避免一加载模块就强绑定到 Qwen3 的具体实现细节。
         from transformers.models.qwen3.modeling_qwen3 import (  # type: ignore
             apply_rotary_pos_emb,
             eager_attention_forward,
@@ -235,10 +237,9 @@ class RosettaModel(nn.Module):
             cos, sin = position_embeddings
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-            # === Injection point (before cache update & attention) ===
-            # Replace current-token key/value with provided cache-space tensors.
-            # Expect same shape as key_states/value_states at this moment:
-            # (B, kv_heads, q_len, head_dim)
+            # 关键注入点：
+            # 在 attention 真正读取 key/value 之前，把“当前 token 对应的 KV”
+            # 换成 projector 融合后的结果，这样本步注意力就能立刻使用 C2C 信息。
             if new_k_cache is not None and new_v_cache is not None:
                 # Only replace if compatible
                 if key_states.shape == new_k_cache.shape:
@@ -278,7 +279,7 @@ class RosettaModel(nn.Module):
         return orig_forward
 
     def register_hooks(self, input_ids, attention_mask, position_ids, base_kv_cache, source_model_idx, source_kv_cache):
-
+        # 先分别跑一遍 base/source，得到“如果不做 monkeypatch 时”这一步各自新增的 KV。
         base_kv_copy = clone_kv_cache(base_kv_cache)
         source_kv_copy = clone_kv_cache(source_kv_cache)
 
@@ -302,6 +303,7 @@ class RosettaModel(nn.Module):
                 ).past_key_values        
         fused_kv_cache = clone_kv_cache(base_output_kv_cache)
 
+        # 逐目标层把 source 新增出来的 KV 投影到 base 的对应层。
         for target_layer_idx, entry in self.projector_dict[self.base_model_idx][source_model_idx].items():
             base_key_cache, base_value_cache = base_output_kv_cache[target_layer_idx]
             new_base_key_cache = base_key_cache[:, :, -new_length:, :]
@@ -324,14 +326,14 @@ class RosettaModel(nn.Module):
                 projected_kv_list.append((projected_key, projected_value))
                 source_kv_list.append(new_source_kv_cache)
 
-            # Use first projector result
+            # include_response 分支目前只使用第一组 projector 结果。
             agg_key, agg_value = projected_kv_list[0]
 
             # Update cache
             fused_kv_cache.key_cache[target_layer_idx][:, :, -new_length:, :] = agg_key
             fused_kv_cache.value_cache[target_layer_idx][:, :, -new_length:, :] = agg_value
 
-        # Monkeypatch attention forward so the modified KV is used in *this* forward pass.
+        # Monkeypatch attention.forward，让当前这次前向就直接消费融合后的 KV。
         hook_handlers = []  # list of (attn_module, orig_forward)
         for i in range(self.model_list[self.base_model_idx].config.num_hidden_layers):
             attn = self.model_list[self.base_model_idx].model.layers[i].self_attn
@@ -390,6 +392,7 @@ class RosettaModel(nn.Module):
             base_attention_mask = attention_mask
             _, seqlen = input_ids.size() if input_ids is not None else (0, 0)
 
+        # prompt/prefill 阶段会重建 cache；decode 阶段通常是单 token 续写，沿用已有 cache。
         if seqlen > 1:
             self.kv_cache_dict = dict()
             
@@ -402,6 +405,7 @@ class RosettaModel(nn.Module):
         
         curr_base_kv_cache = past_key_values
 
+        # 把一段输入拆成多个 section 处理，便于精细控制哪一段启用哪一个 sharer。
         for i in range(num_sections):
             start = section_starts[i]
             end = section_starts[i + 1]
@@ -418,7 +422,7 @@ class RosettaModel(nn.Module):
                                                         source_model_idx=1, 
                                                         source_kv_cache=self.kv_cache_dict[self.base_model_idx][1])
 
-                # calculate target model kvcache
+                # 最后一段是实际要返回 logits 的那一段，base 模型的 forward 输出会直接作为结果返回。
                 output = self.model_list[self.base_model_idx].forward(
                     input_ids=prefill_input_ids,
                     attention_mask=prefill_attention_mask, 
@@ -457,6 +461,7 @@ class RosettaModel(nn.Module):
                     self.kv_cache_dict[self.base_model_idx] = {}
                 if self.base_model_idx not in self.kv_cache_dict[self.base_model_idx]:
                     self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = None
+                # 先把 base 模型自己的 cache 存起来，后续 sharer 的 projector 会基于它做融合。
                 self.kv_cache_dict[self.base_model_idx][self.base_model_idx] = clone_kv_cache(output.past_key_values)
 
                 curr_base_kv_cache: DynamicCache = output.past_key_values
@@ -467,7 +472,7 @@ class RosettaModel(nn.Module):
                     if source_model_idx not in self.kv_cache_dict[self.base_model_idx]:
                         self.kv_cache_dict[self.base_model_idx][source_model_idx] = None
 
-                    # Get model-specific input_ids and attention_mask
+                    # 支持“每个模型一套 tokenizer 输入”和“所有模型共用输入”两种模式。
                     if isinstance(input_ids, list):
                         source_input_ids = input_ids[source_model_idx]
                         source_attention_mask = attention_mask[source_model_idx] if attention_mask is not None else None
@@ -504,10 +509,11 @@ class RosettaModel(nn.Module):
                         if was_training:
                             model.train()
                     
+                    # 统一 cache 类型，方便后面的 projector 逐层取 KV。
                     curr_source_kv_cache = hybrid_to_dynamic(curr_source_kv_cache)
                     self.kv_cache_dict[self.base_model_idx][source_model_idx] = clone_kv_cache(curr_source_kv_cache)
 
-                # calculate source model kvcache and apply projections
+                # 所有 sharer 的 cache 都准备好后，才真正按 kv_cache_index 的指示做融合。
                 if self.base_model_idx in self.projector_dict:
                     # Iterate over all source models in projector_dict
                     sharer_mask = kv_cache_index[i][0][0][0].item()

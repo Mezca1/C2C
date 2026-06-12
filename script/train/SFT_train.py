@@ -103,6 +103,8 @@ def unfreeze_projectors(rosetta_model: RosettaModel):
 
 def detect_training_mode(model_config: Dict[str, Any]) -> str:
     """Detect whether to use baseline or Rosetta training based on config"""
+    # baseline 只训练一个标准语言模型；
+    # rosetta 会同时加载 base + teacher，再训练两者之间的 projector。
     if "baseline_model" in model_config and "base_model" not in model_config:
         return "baseline"
     elif "base_model" in model_config and "teacher_model" in model_config:
@@ -269,7 +271,7 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
         return model, tokenizer, None, None
     
     else:  # rosetta mode
-        # Load tokenizer (use base model tokenizer)
+        # Rosetta 默认把 base model 的 tokenizer 作为主 tokenizer。
         slm_tokenizer = AutoTokenizer.from_pretrained(model_config["base_model"])
 
         if slm_tokenizer.pad_token is None:
@@ -286,14 +288,14 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
                 llm_tokenizer.pad_token_id = llm_tokenizer.eos_token_id
             set_default_chat_template(llm_tokenizer, model_config["teacher_model"])
 
-        # Load base model
+        # base model = receiver，最终负责输出答案。
         base_model = AutoModelForCausalLM.from_pretrained(
             model_config["base_model"],
             torch_dtype=dtype,
             attn_implementation=model_config.get("attn_implementation", None)
         )
         
-        # Load teacher model  
+        # teacher model = sharer，提供可被投影到 base 的额外 KV 语义信息。
         if model_config["teacher_model"] == "google/gemma-3-1b-it":
             teacher_model = AutoModelForCausalLM.from_pretrained(
                 model_config["teacher_model"],
@@ -308,7 +310,7 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
                 attn_implementation=model_config.get("attn_implementation", None)
             )
         
-        # Get model dimensions and layer counts
+        # 根据两边模型的 head 数和每头维度，动态构造 projector 所需形状。
         base_dim = int(base_model.model.layers[0].self_attn.k_proj.out_features / base_model.config.num_key_value_heads)
         teacher_dim = int(teacher_model.model.layers[0].self_attn.k_proj.out_features / teacher_model.config.num_key_value_heads)
         base_num_heads = base_model.config.num_key_value_heads
@@ -316,7 +318,7 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
         slm_num_layers = base_model.config.num_hidden_layers
         llm_num_layers = teacher_model.config.num_hidden_layers
         
-        # Create projector from config
+        # projector 的结构完全由配置驱动，这里只负责把配置实例化成模块列表。
         projector_config = model_config["projector"]
         projector_params = projector_config["params"].copy()
         projector_params["dtype"] = dtype
@@ -376,7 +378,7 @@ def setup_models(model_config: Dict[str, Any], training_mode: str, device: str =
             raise ValueError(f"Invalid mapping strategy: {model_config['mapping']}")
         print(f"Using {model_config['mapping']} mapping strategy (target: [sources])")
 
-        # set projector
+        # 把“源层 -> 目标层”的映射关系注册到 RosettaModel 中。
         for target_layer_idx, src_list in source_target_mapping.items():
             for source_layer_idx in src_list:
                 rosetta_model.set_projector_config(
@@ -626,13 +628,14 @@ def main():
     # Dataset & dataloaders
     # ------------------------------------------------------------------
     print("Loading dataset…")
-    # Create dataset using the auto-registration system
+    # create_dataset 会根据 data.type 自动找到对应的数据集适配器类。
     instruct_ds = create_dataset(
         dataset_type=data_config["type"],
         **data_config["kwargs"]
     )
     
-    # Create dataset based on training mode
+    # baseline 直接产出单模型训练样本；
+    # rosetta 则会准备更适合多模型/KV 对齐的输入结构。
     if training_mode == "baseline":
         full_dataset = BaselineChatDataset(
             instruct_ds, 
@@ -665,7 +668,7 @@ def main():
         train_sampler = None
         eval_sampler = None
 
-    # Create collator based on training mode
+    # collator 负责把变长样本整理成 batch，并生成 labels / kv_cache_index 等训练字段。
     if training_mode == "baseline":
         collator = BaselineDataCollator(
             tokenizer=main_tokenizer,
@@ -753,7 +756,8 @@ def main():
             weight_decay=training_config["weight_decay"]
         )
     else:  # rosetta mode
-        # Separate parameter groups for Rosetta mode
+        # Rosetta 模式把 gate / 权重 / 其他 projector 参数分组，
+        # 方便后续需要时对不同参数族采用不同训练策略。
         gate_params = []
         weight_params = []
         other_params = []
@@ -786,6 +790,7 @@ def main():
     print("Starting training…")
     global_step = 0
     optimizer.zero_grad()
+    skip_no_grad_loss = training_config.get("skip_no_grad_loss", False)
     for epoch in range(training_config["num_epochs"]):
         if distributed and train_sampler is not None:
             # Ensure different shuffles across epochs in distributed setup
@@ -806,6 +811,8 @@ def main():
             with sync_ctx:
                 loss = train_step(model, batch, main_tokenizer, training_config["max_length"], device, training_mode)
                 true_loss_value = loss.detach().item()
+                if skip_no_grad_loss and (not loss.requires_grad or not torch.isfinite(loss.detach())):
+                    continue
                 scaled_loss = loss / grad_accum_steps  # Gradient accumulation
                 scaled_loss.backward()
 

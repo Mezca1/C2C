@@ -1,0 +1,26 @@
+model:
+  model_name: Rosetta
+  rosetta_config:
+    base_model: /home/lishaowei/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+    teacher_model: /home/lishaowei/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775
+    is_do_alignment: false
+    alignment_strategy: "longest"
+    checkpoints_dir: local/checkpoints/0.6+0.5B_residual_hybrid_a0.8_smoke/final
+
+  generation_config:
+    do_sample: false
+    max_new_tokens: 64
+
+output:
+  output_dir: local/final_results/residual_hybrid_a0.8_nutrition_offline
+
+eval:
+  dataset: mmlu-redux
+  gpu_ids: [0]
+  answer_method: generate
+  use_cot: false
+  use_template: true
+  sample_interval: 1
+  subjects: ["nutrition"]
+  limit: 100
+  math_grading_method: "comprehensive"
